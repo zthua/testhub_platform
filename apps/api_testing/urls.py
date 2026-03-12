@@ -8,7 +8,8 @@ from .views import (
     TestSuiteRequestViewSet, TestExecutionViewSet, UserViewSet,
     ScheduledTaskViewSet, TaskExecutionLogViewSet, NotificationLogViewSet,
     TaskNotificationSettingViewSet, OperationLogViewSet,
-    ApiDashboardViewSet, AIServiceConfigViewSet
+    ApiDashboardViewSet, SignatureConfigViewSet, ScriptViewSet,
+    ApolloConfigViewSet
 )
 
 router = DefaultRouter()
@@ -27,10 +28,12 @@ router.register(r'task-execution-logs', TaskExecutionLogViewSet, basename='taske
 router.register(r'notification-logs', NotificationLogViewSet)
 router.register(r'task-notification-settings', TaskNotificationSettingViewSet)
 router.register(r'operation-logs', OperationLogViewSet)
-router.register(r'ai-service-configs', AIServiceConfigViewSet, basename='aiserviceconfig')
+router.register(r'signature-configs', SignatureConfigViewSet)
+router.register(r'scripts', ScriptViewSet, basename='script')
+router.register(r'apollo-config', ApolloConfigViewSet, basename='apollo-config')
 
 urlpatterns = [
-    path('api-testing/', include(router.urls)),
+    path('', include(router.urls)),
 ]
 
 # 添加媒体文件路由
