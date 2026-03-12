@@ -25,7 +25,7 @@ from .models import (
     ApiProject, ApiCollection, ApiRequest, Environment,
     RequestHistory, TestSuite, TestExecution, TestSuiteRequest,
     ScheduledTask, TaskExecutionLog, NotificationLog,
-    TaskNotificationSetting, OperationLog, AIServiceConfig,
+    TaskNotificationSetting, OperationLog, SignatureConfig, Script,
 )
 
 from .serializers import (
@@ -35,20 +35,21 @@ from .serializers import (
     ScheduledTaskSerializer, TaskExecutionLogSerializer,
     NotificationLogSerializer, TaskNotificationSettingSerializer,
     NotificationLogDetailSerializer,
-    TaskNotificationSettingDetailSerializer, OperationLogSerializer
+    TaskNotificationSettingDetailSerializer, OperationLogSerializer,
+    SignatureConfigSerializer, ScriptSerializer
 )
 
 logger = logging.getLogger(__name__)
 
 from .utils import execute_assertions
 from .operation_logger import log_operation
-from .variable_resolver import VariableResolver
+from .parameter_functions import replace_parameters, replace_parameters_in_dict, execute_parameter_function
+from .signature_utils import generate_signature, SignatureAlgorithm
 from .serializers import (
     ApiProjectSerializer, ApiCollectionSerializer, ApiRequestSerializer,
     EnvironmentSerializer, RequestHistorySerializer, TestSuiteSerializer,
     TestSuiteRequestSerializer, TestExecutionSerializer, UserSerializer,
-    ScheduledTaskSerializer, ScheduledTaskSerializer,
-    AIServiceConfigSerializer
+    ScheduledTaskSerializer, ScheduledTaskSerializer
 )
 
 User = get_user_model()
@@ -278,7 +279,7 @@ class ApiCollectionViewSet(viewsets.ModelViewSet):
 
 
 class ApiRequestViewSet(viewsets.ModelViewSet):
-    queryset = ApiRequest.objects.all()
+    queryset = ApiRequest.objects.all().order_by('order', 'id')
     serializer_class = ApiRequestSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -287,35 +288,12 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        # 获取用户有权限的项目
-        accessible_projects = ApiProject.objects.filter(
-            models.Q(owner=user) | models.Q(members=user)
-        )
-
-        # 查询两种接口：
-        # 1. 关联到集合的接口（集合所属项目是用户有权限的）
-        # 2. 或者是用户创建的且没有关联集合的接口
-        queryset = ApiRequest.objects.filter(
-            models.Q(
-                collection__project__in=accessible_projects
-            ) | models.Q(
-                collection__isnull=True,
-                created_by=user
+        return ApiRequest.objects.filter(
+            collection__project__in=ApiProject.objects.filter(
+                models.Q(owner=user) | models.Q(members=user)
             )
-        ).distinct()
-
-        project_id = self.request.query_params.get('project')
-        if project_id:
-            # 如果指定了项目，则只查询该项目下的接口（包括未关联集合但创建者是当前用户的）
-            queryset = queryset.filter(
-                models.Q(collection__project_id=project_id) | models.Q(
-                    collection__isnull=True,
-                    created_by=user
-                )
-            ).distinct()
-
-        return queryset
-
+        ).distinct().order_by('order', 'id')
+    
     def perform_create(self, serializer):
         """创建接口时记录日志"""
         instance = serializer.save()
@@ -351,136 +329,34 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
-        """执行API请求"""
+        """执行API请求 - 使用统一的执行逻辑"""
+        from .utils import execute_api_request
+
         api_request = self.get_object()
         environment_id = request.data.get('environment_id')
-        
+
+        # 获取环境对象
+        environment = None
+        if environment_id:
+            try:
+                environment = Environment.objects.get(id=environment_id)
+            except Environment.DoesNotExist:
+                return Response({'error': '环境不存在'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 使用统一的请求执行函数
         try:
-            # 创建变量解析器
-            resolver = VariableResolver()
+            result = execute_api_request(api_request, environment, request.user)
 
-            # 解析环境变量
-            variables = {}
-            if environment_id:
-                env = Environment.objects.get(id=environment_id)
-                variables.update(env.variables)
-            
-            # 使用前端发送的更新后的数据，如果没有则使用数据库中的数据
-            request_params = request.data.get('params', api_request.params)
-            request_headers = request.data.get('headers', api_request.headers)
-            request_body = request.data.get('body', api_request.body)
-            request_method = request.data.get('method', api_request.method)
-            request_url = request.data.get('url', api_request.url)
+            if not result.get('success'):
+                # 请求执行失败
+                return Response({
+                    'error': result.get('error', '请求执行失败'),
+                    'traceback': result.get('traceback')
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            # 替换URL中的变量（先解析动态函数，再替换环境变量）
-            url = self._replace_variables(request_url or '', variables)
-            url = resolver.resolve(url)
-            
-            # 准备请求头
-            headers = {}
-            if isinstance(request_headers, list):
-                for header_item in request_headers:
-                    if header_item.get('enabled', True) and header_item.get('key'):
-                        key = header_item['key']
-                        value = self._replace_variables(str(header_item.get('value', '')), variables)
-                        value = resolver.resolve(value)
-                        headers[key] = value
-            else:
-                headers = request_headers.copy() if request_headers else {}
-                for key, value in headers.items():
-                    headers[key] = self._replace_variables(str(value), variables)
-                    headers[key] = resolver.resolve(headers[key])
+            # 获取历史记录以返回完整数据
+            history = RequestHistory.objects.get(id=result['history_id'])
 
-            # 准备请求参数
-            params = request_params.copy() if request_params else {}
-            for key, value in params.items():
-                params[key] = self._replace_variables(str(value), variables)
-                params[key] = resolver.resolve(params[key])
-
-            # 准备请求体
-            body_data = None
-            body_type = 'none'
-            if request_body and request_method in ['POST', 'PUT', 'PATCH']:
-                body_type = request_body.get('type', 'none')
-                body_content = request_body.get('data')
-
-                if body_type == 'json':
-                    if isinstance(body_content, dict):
-                        body_data = self._replace_variables_in_dict(body_content, variables)
-                        body_data = self._resolve_variables_in_dict(body_data, resolver)
-                    else:
-                        body_data = body_content
-                elif body_type == 'raw':
-                    if isinstance(body_content, str):
-                        body_data = self._replace_variables(body_content, variables)
-                        body_data = resolver.resolve(body_data)
-                    else:
-                        body_data = body_content
-                elif body_type in ['form-data', 'x-www-form-urlencoded']:
-                    if isinstance(body_content, list):
-                        body_data = self._replace_variables_in_dict(body_content, variables)
-                        body_data = self._resolve_variables_in_dict(body_data, resolver)
-                    else:
-                        body_data = body_content
-                else:
-                    body_data = body_content
-            
-            # 执行请求
-            start_time = time.time()
-
-            # 根据请求体类型决定使用 data 还是 json 参数
-            if body_type == 'raw':
-                # raw 类型使用 data 参数，发送原始字符串
-                response = requests.request(
-                    method=request_method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    data=body_data,
-                    timeout=30
-                )
-            else:
-                # json 类型使用 json 参数，自动序列化
-                response = requests.request(
-                    method=request_method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=body_data,
-                    timeout=30
-                )
-            end_time = time.time()
-            
-            response_time = (end_time - start_time) * 1000  # 转换为毫秒
-            
-            # 执行断言验证
-            assertions = request.data.get('assertions', api_request.assertions) or []
-            for assertion in assertions:
-                if assertion.get('type') == 'response_time':
-                    assertion['actual_time'] = response_time
-            assertions_results = execute_assertions(response, assertions)
-            
-            # 保存请求历史
-            history = RequestHistory.objects.create(
-                request=api_request,
-                environment_id=environment_id,
-                request_data={
-                    'url': url,
-                    'method': request_method,
-                    'headers': headers,
-                    'params': params,
-                    'body': body_data
-                },
-                response_data={
-                    'headers': dict(response.headers),
-                    'body': response.text,
-                    'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
-                },
-                status_code=response.status_code,
-                response_time=response_time,
-                executed_by=request.user
-            )
-            
             # 记录执行操作
             log_operation(
                 operation_type='execute',
@@ -489,13 +365,13 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                 resource_name=api_request.name,
                 user=request.user
             )
-            
+
             # 返回包含断言结果的数据
             history_data = RequestHistorySerializer(history).data
-            history_data['assertions_results'] = assertions_results
-            
+            history_data['assertions_results'] = result['assertions_results']
+
             return Response(history_data)
-            
+
         except Exception as e:
             # 保存错误历史
             history = RequestHistory.objects.create(
@@ -511,8 +387,56 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
                 error_message=str(e),
                 executed_by=request.user
             )
-            
+
             return Response(RequestHistorySerializer(history).data, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=False, methods=['post'], url_path='reorder')
+    def reorder(self, request):
+        """
+        批量更新接口排序
+        
+        请求体格式:
+        {
+            "requests": [
+                {"id": 1, "order": 0},
+                {"id": 2, "order": 1},
+                {"id": 3, "order": 2}
+            ]
+        }
+        """
+        requests_data = request.data.get('requests', [])
+        
+        if not requests_data:
+            return Response({'error': '请提供要排序的接口列表'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # 批量更新排序
+            updated_count = 0
+            for item in requests_data:
+                request_id = item.get('id')
+                order = item.get('order')
+                
+                if request_id is None or order is None:
+                    continue
+                
+                try:
+                    api_request = ApiRequest.objects.get(id=request_id)
+                    api_request.order = order
+                    api_request.save(update_fields=['order'])
+                    updated_count += 1
+                except ApiRequest.DoesNotExist:
+                    continue
+            
+            return Response({
+                'success': True,
+                'message': f'成功更新 {updated_count} 个接口的排序',
+                'updated_count': updated_count
+            })
+        
+        except Exception as e:
+            return Response({
+                'error': f'更新排序失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     def _replace_variables(self, text, variables):
         """替换文本中的变量"""
@@ -536,17 +460,6 @@ class ApiRequestViewSet(viewsets.ModelViewSet):
             return [self._replace_variables_in_dict(item, variables) for item in data]
         elif isinstance(data, str):
             return self._replace_variables(data, variables)
-        else:
-            return data
-
-    def _resolve_variables_in_dict(self, data, resolver):
-        """递归解析字典中的动态函数占位符"""
-        if isinstance(data, dict):
-            return {k: self._resolve_variables_in_dict(v, resolver) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [self._resolve_variables_in_dict(item, resolver) for item in data]
-        elif isinstance(data, str):
-            return resolver.resolve(data)
         else:
             return data
 
@@ -680,195 +593,86 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
-        """执行测试套件"""
+        """执行测试套件 - 使用统一的执行逻辑，支持运行时输入参数"""
+        from .utils import execute_test_suite_with_runtime_input
+
         test_suite = self.get_object()
-        
-        try:
-            # 创建执行记录
-            execution = TestExecution.objects.create(
-                test_suite=test_suite,
-                status='RUNNING',
-                start_time=timezone.now(),
-                executed_by=request.user
-            )
-            
-            # 获取套件中的请求
-            suite_requests = TestSuiteRequest.objects.filter(
-                test_suite=test_suite,
-                enabled=True
-            ).order_by('order')
-            
-            execution.total_requests = suite_requests.count()
-            execution.save()
-            
-            results = []
-            passed_count = 0
-            failed_count = 0
-            
-            # 创建变量解析器
-            resolver = VariableResolver()
 
-            # 执行每个请求
-            for suite_request in suite_requests:
-                api_request = suite_request.request
-                
-                try:
-                    # 解析环境变量
-                    variables = {}
-                    if test_suite.environment:
-                        variables.update(test_suite.environment.variables)
-                    
-                    # 替换URL中的变量（先解析动态函数，再替换环境变量）
-                    url = self._replace_variables(api_request.url, variables)
-                    url = resolver.resolve(url)
+        # 获取运行时输入参数
+        runtime_inputs = request.data.get('runtime_inputs', {})
 
-                    # 准备请求头
-                    headers = {}
-                    # 支持新的数组格式和旧的对象格式
-                    if isinstance(api_request.headers, list):
-                        # 新的数组格式 [{"key": "Authorization", "value": "Bearer {{token}}", "enabled": true, "description": "..."}]
-                        for header_item in api_request.headers:
-                            if header_item.get('enabled', True) and header_item.get('key'):
-                                key = header_item['key']
-                                value = self._replace_variables(str(header_item.get('value', '')), variables)
-                                value = resolver.resolve(value)
-                                headers[key] = value
-                    else:
-                        # 旧的对象格式 {"Authorization": "Bearer {{token}}"}
-                        headers = api_request.headers.copy()
-                        for key, value in headers.items():
-                            headers[key] = self._replace_variables(str(value), variables)
-                            headers[key] = resolver.resolve(headers[key])
+        # 使用支持运行时输入的测试套件执行函数
+        result = execute_test_suite_with_runtime_input(
+            test_suite,
+            test_suite.environment,
+            request.user,
+            runtime_inputs=runtime_inputs
+        )
 
-                    params = api_request.params.copy()
-                    for key, value in params.items():
-                        params[key] = self._replace_variables(str(value), variables)
-                        params[key] = resolver.resolve(params[key])
+        # 检查是否需要用户输入
+        if result.get('need_user_input'):
+            return Response({
+                'need_user_input': True,
+                'execution_id': result['execution_id'],
+                'current_request_id': result['current_request_id'],
+                'current_request_name': result['current_request_name'],
+                'input_config': result['input_config'],
+                'temp_vars': result['temp_vars'],
+                'current_order': result['current_order']
+            })
 
-                    body_data = None
-                    if api_request.body and api_request.method in ['POST', 'PUT', 'PATCH']:
-                        if api_request.body.get('type') == 'json':
-                            body_data = api_request.body.get('data', {})
-                            body_data = self._replace_variables_in_dict(body_data, variables)
-                            body_data = self._resolve_variables_in_dict(body_data, resolver)
+        if not result.get('success'):
+            return Response({
+                'error': result.get('error', '测试套件执行失败'),
+                'traceback': result.get('traceback')
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-                    # 执行请求
-                    start_time = time.time()
-                    response = requests.request(
-                        method=api_request.method,
-                        url=url,
-                        headers=headers,
-                        params=params,
-                        json=body_data,
-                        timeout=30
-                    )
-                    end_time = time.time()
-                    response_time = (end_time - start_time) * 1000
-                    
-                    # 执行断言验证
-                    assertions = api_request.assertions or []
-                    # 添加响应时间到断言中
-                    for assertion in assertions:
-                        if assertion.get('type') == 'response_time':
-                            assertion['actual_time'] = response_time
-                    
-                    # 使用共享的断言执行方法
-                    assertions_results = execute_assertions(response, assertions)
-                    
-                    # 检查所有断言是否通过
-                    passed = True
-                    error_message = ''
-                    
-                    # 检查套件请求的断言
-                    for assertion in suite_request.assertions:
-                        # 简单的状态码断言
-                        if assertion.get('type') == 'status_code':
-                            expected = assertion.get('value')
-                            if response.status_code != expected:
-                                passed = False
-                                error_message = f'状态码断言失败: 期望 {expected}, 实际 {response.status_code}'
-                                break
-                    
-                    # 检查接口自身的断言
-                    if passed and assertions_results:
-                        for assertion_result in assertions_results:
-                            if not assertion_result.get('passed', True):
-                                passed = False
-                                error_message = f"断言失败: {assertion_result.get('name', '未命名断言')} - {assertion_result.get('error', '断言不通过')}"
-                                break
-                    
-                    if passed:
-                        passed_count += 1
-                    else:
-                        failed_count += 1
-                    
-                    results.append({
-                        'name': api_request.name,
-                        'method': api_request.method,
-                        'url': url,
-                        'status_code': response.status_code,
-                        'response_time': response_time,
-                        'passed': passed,
-                        'error': error_message,
-                        'assertions_results': assertions_results
-                    })
-                    
-                    # 保存请求历史
-                    RequestHistory.objects.create(
-                        request=api_request,
-                        environment=test_suite.environment,
-                        request_data={
-                            'url': url,
-                            'method': api_request.method,
-                            'headers': headers,
-                            'params': params,
-                            'body': body_data
-                        },
-                        response_data={
-                            'headers': dict(response.headers),
-                            'body': response.text,
-                            'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
-                        },
-                        status_code=response.status_code,
-                        response_time=response_time,
-                        assertions_results=assertions_results,
-                        executed_by=request.user
-                    )
-                    
-                except Exception as e:
-                    failed_count += 1
-                    results.append({
-                        'name': api_request.name,
-                        'method': api_request.method,
-                        'url': api_request.url,
-                        'passed': False,
-                        'error': str(e)
-                    })
-            
-            # 更新执行结果
-            execution.end_time = timezone.now()
-            execution.passed_requests = passed_count
-            execution.failed_requests = failed_count
-            execution.status = 'COMPLETED' if failed_count == 0 else 'FAILED'
-            execution.results = results
-            execution.save()
-            
-            # 记录执行操作
-            log_operation(
-                operation_type='execute',
-                resource_type='suite',
-                resource_id=test_suite.id,
-                resource_name=test_suite.name,
-                user=request.user
-            )
-            
-            return Response(TestExecutionSerializer(execution).data)
-            
-        except Exception as e:
-            execution.status = 'FAILED'
-            execution.end_time = timezone.now()
-            execution.save()
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # 获取执行记录
+        execution = TestExecution.objects.get(id=result['execution_id'])
+        return Response(TestExecutionSerializer(execution).data)
+
+    @action(detail=True, methods=['post'], url_path='continue-execution')
+    def continue_execution(self, request, pk=None):
+        """继续执行测试套件（在用户输入后）"""
+        from .utils import continue_test_suite_execution
+
+        execution_id = request.data.get('execution_id')
+        runtime_inputs = request.data.get('runtime_inputs', {})
+        temp_vars_dict = request.data.get('temp_vars', {})
+
+        if not execution_id:
+            return Response({
+                'error': '缺少execution_id参数'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        result = continue_test_suite_execution(
+            execution_id,
+            runtime_inputs,
+            temp_vars_dict
+        )
+
+        # 检查是否还需要更多用户输入
+        if result.get('need_user_input'):
+            return Response({
+                'need_user_input': True,
+                'execution_id': result['execution_id'],
+                'current_request_id': result['current_request_id'],
+                'current_request_name': result['current_request_name'],
+                'input_config': result['input_config'],
+                'temp_vars': result['temp_vars'],
+                'current_order': result['current_order'],
+                'partial_results': result.get('partial_results', [])
+            })
+
+        if not result.get('success'):
+            return Response({
+                'error': result.get('error', '测试套件继续执行失败'),
+                'traceback': result.get('traceback')
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 获取执行记录
+        execution = TestExecution.objects.get(id=result['execution_id'])
+        return Response(TestExecutionSerializer(execution).data)
 
     def perform_create(self, serializer):
         """创建测试套件时记录日志"""
@@ -951,17 +755,6 @@ class TestSuiteViewSet(viewsets.ModelViewSet):
             return self._replace_variables(data, variables)
         else:
             return data
-    
-    def _resolve_variables_in_dict(self, data, resolver):
-        """递归解析字典中的动态函数占位符"""
-        if isinstance(data, dict):
-            return {k: self._resolve_variables_in_dict(v, resolver) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [self._resolve_variables_in_dict(item, resolver) for item in data]
-        elif isinstance(data, str):
-            return resolver.resolve(data)
-        else:
-            return data
 
 
 class TestSuiteRequestViewSet(viewsets.ModelViewSet):
@@ -1004,14 +797,14 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
         
         try:
             # 创建报告目录
-            results_dir = os.path.join(settings.MEDIA_ROOT, 'api-testing', 'allure-results', f'execution_{execution.id}')
+            results_dir = os.path.join(settings.MEDIA_ROOT, 'allure-results', f'execution_{execution.id}')
             os.makedirs(results_dir, exist_ok=True)
             
             # 生成测试结果文件
             self._generate_test_result_files(execution, results_dir)
             
             # 生成Allure报告
-            report_output_dir = os.path.join(settings.MEDIA_ROOT, 'api-testing', 'allure-reports', f'execution_{execution.id}')
+            report_output_dir = os.path.join(settings.MEDIA_ROOT, 'allure-reports', f'execution_{execution.id}')
             os.makedirs(report_output_dir, exist_ok=True)
             
             # 使用Allure命令行工具生成完整报告
@@ -1020,120 +813,73 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
             import time
             from pathlib import Path
             
-            # 检查 Java 环境
-            java_available = self._check_java_environment()
-            if not java_available:
-                logger.warning("Java 环境未配置，将使用简单报告")
-            
             # Allure命令行工具路径 - 使用相对路径
             base_dir = Path(__file__).resolve().parent.parent.parent
             
-            # 根据操作系统确定可执行文件名
+            # Determine executable name based on OS
             if os.name == 'nt':
                 allure_executable = 'allure.bat'
             else:
                 allure_executable = 'allure'
                 
-            allure_cmd = base_dir / 'allure' / 'bin' / allure_executable
+            allure_cmd = str(base_dir / 'allure' / 'bin' / allure_executable)
 
-            if not allure_cmd.exists():
-                logger.warning(f"Allure command not found at: {allure_cmd}, trying system paths")
+            if not os.path.exists(allure_cmd):
+                logger.warning(f"Allure command not found at: {allure_cmd}, using fallback")
                 # 尝试其他可能的路径
                 possible_paths = [
+                    base_dir / 'allure' / 'bin' / allure_executable,
                     Path('/usr/local/bin/allure'),  # 系统安装的allure
                     Path('/usr/bin/allure'),  # 系统安装的allure
                 ]
-                allure_cmd = None
                 for path in possible_paths:
                     if path.exists():
-                        allure_cmd = path
+                        allure_cmd = str(path)
                         break
+                else:
+                    allure_cmd = None
             
             # 确保所有目录存在
             os.makedirs(results_dir, exist_ok=True)
-            
-            if allure_cmd and java_available:
+            if allure_cmd:
                 try:
                     for _ in range(3):  # 重试机制
                         try:
-                            # 如果目录已存在，先清理（处理权限问题）
+                            # 如果目录已存在，先清理
                             if os.path.exists(report_output_dir):
-                                try:
-                                    shutil.rmtree(report_output_dir)
-                                except PermissionError as pe:
-                                    logger.warning(f"无法删除目录（权限不足）：{report_output_dir}，尝试清理内容")
-                                    # 尝试只删除内容，保留目录
-                                    for item in os.listdir(report_output_dir):
-                                        item_path = os.path.join(report_output_dir, item)
-                                        try:
-                                            if os.path.isdir(item_path):
-                                                shutil.rmtree(item_path)
-                                            else:
-                                                os.remove(item_path)
-                                        except Exception:
-                                            pass  # 跳过无法删除的文件
-                            
-                            # 构建命令行参数（路径统一使用字符串格式）
-                            if os.name == 'nt':
-                                # Windows 下通过 cmd /c 执行批处理文件
-                                cmd_list = [
-                                    'cmd', '/c',
-                                    str(allure_cmd),
-                                    'generate',
-                                    str(Path(results_dir)),
-                                    '--clean',
-                                    '--output', str(Path(report_output_dir))
-                                ]
-                            else:
-                                # Linux/Mac 直接执行
-                                cmd_list = [
-                                    str(allure_cmd),
-                                    'generate',
-                                    str(Path(results_dir)),
-                                    '--clean',
-                                    '--output', str(Path(report_output_dir))
-                                ]
+                                shutil.rmtree(report_output_dir)
                             
                             # 生成Allure报告
-                            result = subprocess.run(
-                                cmd_list,
-                                check=True,
-                                capture_output=True,
-                                text=True,
-                                timeout=30
-                            )
-                            logger.info(f"Allure 报告生成成功: {result.stdout}")
+                            subprocess.run([
+                                allure_cmd, 'generate',
+                                results_dir,
+                                '--clean',
+                                '--output', report_output_dir
+                            ], check=True, capture_output=True, text=True, timeout=30)
                             break
                         except subprocess.TimeoutExpired:
                             if _ == 2:  # 最后一次尝试
                                 raise
-                            logger.warning(f"Allure 命令超时，第 {_ + 1} 次重试...")
                             time.sleep(1)
                             continue
-                except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-                    # 如果Allure命令失败，记录详细错误信息
-                    error_detail = str(e)
-                    if hasattr(e, 'stderr') and e.stderr:
-                        error_detail = f"{error_detail}\nStderr: {e.stderr}"
-                    logger.error(f"Allure 命令执行失败: {error_detail}")
-                    
-                    # 不再使用回退方案，直接返回错误
-                    return Response({
-                        'error': 'Allure 报告生成失败',
-                        'detail': error_detail,
-                        'suggestion': (
-                            '请检查以下项目：\n'
-                            '1. Java 是否已安装并配置（JAVA_HOME 或 java 命令可用）\n'
-                            '2. Allure 工具是否完整（项目根目录 allure/bin/ 目录）\n'
-                            '3. 目录权限是否正确\n'
-                            '4. 查看后端日志获取详细错误信息'
-                        )
-                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            else:
-                # 如果没有 Allure 工具或 Java 环境，生成简单的 HTML 报告
-                logger.warning("Allure 工具或 Java 环境不可用，生成简单报告")
-                os.makedirs(report_output_dir, exist_ok=True)
-                fallback_html = f"""
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    # 如果Allure命令失败，回退到静态文件复制方式
+                    logger.warning(f"Allure command failed: {str(e)}, falling back to static files")
+                
+                static_dir = os.path.join(settings.MEDIA_ROOT, 'allure-static')
+                if os.path.exists(static_dir):
+                    for item in os.listdir(static_dir):
+                        source = os.path.join(static_dir, item)
+                        destination = os.path.join(report_output_dir, item)
+                        if os.path.isdir(source):
+                            shutil.copytree(source, destination, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(source, destination)
+                
+                # 始终确保有可用的报告
+                if not os.path.exists(os.path.join(report_output_dir, 'index.html')):
+                    # 创建回退的简单报告
+                    fallback_html = f"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -1149,8 +895,8 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
 </body>
 </html>
 """
-                with open(os.path.join(report_output_dir, 'index.html'), 'w', encoding='utf-8') as f:
-                    f.write(fallback_html)
+                    with open(os.path.join(report_output_dir, 'index.html'), 'w', encoding='utf-8') as f:
+                        f.write(fallback_html)
             
             # 创建自定义的summary.html页面作为报告概览
             status_class = "status-passed" if execution.status == "COMPLETED" else "status-failed"
@@ -1424,72 +1170,32 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
             
             return Response({
                 'message': 'Allure报告生成成功',
-                'report_url': f'/media/api-testing/allure-reports/execution_{execution.id}/summary.html'
+                'report_url': f'/media/allure-reports/execution_{execution.id}/summary.html'
             })
         except Exception as e:
-            import traceback
-            error_detail = str(e)
-            error_traceback = traceback.format_exc()
-            logger.error(f"生成Allure报告失败: {error_detail}\n{error_traceback}")
-            return Response({
-                'error': error_detail,
-                'detail': error_traceback
-            }, status=status.HTTP_400_BAD_REQUEST)
-    
-    def _check_java_environment(self):
-        """检查 Java 运行环境是否可用"""
-        try:
-            # 首先检查 JAVA_HOME 环境变量
-            java_home = os.environ.get('JAVA_HOME')
-            if java_home:
-                logger.info(f"检测到 JAVA_HOME: {java_home}")
-            
-            # 尝试执行 java -version 命令
-            result = subprocess.run(
-                ['java', '-version'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            if result.returncode == 0:
-                # Java 可用，记录版本信息
-                java_version = result.stderr.split('\n')[0] if result.stderr else 'Unknown'
-                logger.info(f"Java 环境可用: {java_version}")
-                return True
-            else:
-                logger.warning(f"Java 命令执行失败: {result.stderr}")
-                return False
-                
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logger.warning(f"Java 环境检查失败: {str(e)}")
-            return False
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
     
     def _generate_test_result_files(self, execution, report_dir):
         """生成测试结果文件"""
-        try:
-            # 检查execution.results是否存在
-            if not execution.results:
-                logger.warning(f"执行记录 {execution.id} 没有结果数据")
-                return
-
-            # 生成容器文件，定义测试套件
-            container_data = {
-                "uuid": str(execution.id),
-                "name": execution.test_suite.name,
-                "children": []
-            }
-
-            # 为每个测试请求添加到children列表
+        # 生成容器文件，定义测试套件
+        container_data = {
+            "uuid": str(execution.id),
+            "name": execution.test_suite.name,
+            "children": []
+        }
+        
+        # 为每个测试请求添加到children列表
+        if execution.results:
             for i, result in enumerate(execution.results):
                 container_data["children"].append(f"{execution.id}-{i}")
-
-            # 保存容器文件
-            container_file_path = os.path.join(report_dir, f'{execution.id}-container.json')
-            with open(container_file_path, 'w', encoding='utf-8') as f:
-                json.dump(container_data, f, ensure_ascii=False, indent=2)
-
-            # 只生成每个测试请求的结果文件，不生成测试套件的结果文件
+        
+        # 保存容器文件
+        container_file_path = os.path.join(report_dir, f'{execution.id}-container.json')
+        with open(container_file_path, 'w', encoding='utf-8') as f:
+            json.dump(container_data, f, ensure_ascii=False, indent=2)
+        
+        # 只生成每个测试请求的结果文件，不生成测试套件的结果文件
+        if execution.results:
             for i, result in enumerate(execution.results):
                 request_result = {
                     "uuid": f"{execution.id}-{i}",
@@ -1543,11 +1249,6 @@ class TestExecutionViewSet(viewsets.ReadOnlyModelViewSet):
                 request_file_path = os.path.join(report_dir, f'{execution.id}-{i}-result.json')
                 with open(request_file_path, 'w', encoding='utf-8') as f:
                     json.dump(request_result, f, ensure_ascii=False, indent=2)
-
-        except Exception as e:
-            import traceback
-            logger.error(f"生成测试结果文件失败: {str(e)}\n{traceback.format_exc()}")
-            raise
 
 
 class UserViewSet(viewsets.ReadOnlyModelViewSet):
@@ -2391,401 +2092,290 @@ class ApiDashboardViewSet(viewsets.ViewSet):
         })
 
 
-class AIServiceConfigViewSet(viewsets.ModelViewSet):
-    """AI服务配置视图集"""
-    queryset = AIServiceConfig.objects.all()
-    serializer_class = AIServiceConfigSerializer
+# ================ 签名配置管理 ================
+
+class SignatureConfigViewSet(viewsets.ModelViewSet):
+    """签名配置视图集"""
+    queryset = SignatureConfig.objects.all()
+    serializer_class = SignatureConfigSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['project', 'is_enabled', 'is_default']
+    search_fields = ['name', 'description']
+
+    def get_queryset(self):
+        user = self.request.user
+        return SignatureConfig.objects.filter(
+            project__in=ApiProject.objects.filter(
+                models.Q(owner=user) | models.Q(members=user)
+            )
+        ).distinct()
+
+    @action(detail=True, methods=['post'])
+    def set_default(self, request, pk=None):
+        """设置为默认签名配置"""
+        config = self.get_object()
+        config.is_default = True
+        config.save()
+        return Response({'message': '已设置为默认配置'})
+
+    @action(detail=True, methods=['post'])
+    def test_signature(self, request, pk=None):
+        """测试签名生成"""
+        config = self.get_object()
+        test_body = request.data.get('test_body', {})
+        test_params = request.data.get('test_params', {})
+
+        try:
+            signature = generate_signature(
+                body=test_body,
+                algorithm=config.algorithm,
+                secret_key=config.secret_key if config.secret_key else None,
+                extra_params=test_params,
+                rsa_private_key=config.rsa_private_key if config.rsa_private_key else None,
+                sm2_private_key=config.sm2_private_key if config.sm2_private_key else None,
+                sm2_mode=config.sm2_mode if config.sm2_mode else 'C1C2C3'
+            )
+            return Response({
+                'signature': signature,
+                'algorithm': config.algorithm,
+                'message': '签名生成成功'
+            })
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class ScriptViewSet(viewsets.ModelViewSet):
+    """脚本管理视图集"""
+    queryset = Script.objects.all()
+    serializer_class = ScriptSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['service_type', 'role', 'is_active']
-    search_fields = ['name', 'model_name']
-    ordering_fields = ['created_at', 'name']
+    filterset_fields = ['project', 'script_type', 'is_active']
+    search_fields = ['name', 'description']
+    ordering_fields = ['created_at', 'updated_at', 'name']
     ordering = ['-created_at']
 
     def get_queryset(self):
         user = self.request.user
-        return AIServiceConfig.objects.filter(created_by=user)
+        return Script.objects.filter(
+            project__in=ApiProject.objects.filter(
+                models.Q(owner=user) | models.Q(members=user)
+            )
+        ).distinct()
+
+    def perform_create(self, serializer):
+        """创建脚本时自动设置创建者"""
+        instance = serializer.save()
+        log_operation(
+            operation_type='create',
+            resource_type='script',
+            resource_id=instance.id,
+            resource_name=instance.name,
+            user=self.request.user
+        )
+
+    def perform_update(self, serializer):
+        """更新脚本时记录日志"""
+        instance = serializer.save()
+        log_operation(
+            operation_type='edit',
+            resource_type='script',
+            resource_id=instance.id,
+            resource_name=instance.name,
+            user=self.request.user
+        )
+
+    def perform_destroy(self, instance):
+        """删除脚本时记录日志"""
+        log_operation(
+            operation_type='delete',
+            resource_type='script',
+            resource_id=instance.id,
+            resource_name=instance.name,
+            user=self.request.user
+        )
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        """启用脚本"""
+        script = self.get_object()
+        script.is_active = True
+        script.save()
+        return Response({'message': '脚本已启用'})
+
+    @action(detail=True, methods=['post'])
+    def deactivate(self, request, pk=None):
+        """禁用脚本"""
+        script = self.get_object()
+        script.is_active = False
+        script.save()
+        return Response({'message': '脚本已禁用'})
+
+
+class ApolloConfigViewSet(viewsets.ViewSet):
+    """Apollo 配置管理视图集"""
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        """获取所有可用环境配置"""
+        from apps.api_testing.apollo_config_manager import CONFIG_SETTINGS
+
+        configs = []
+        for key, value in CONFIG_SETTINGS.items():
+            configs.append({
+                'name': key,
+                'appId': value['appId'],
+                'env': value['env'],
+                'clusterName': value['clusterName'],
+                'namespaceName': value['namespaceName'],
+                'portal_address': value['portal_address']
+            })
+
+        return Response({
+            'configs': configs,
+            'message': '获取环境配置成功'
+        })
 
     @action(detail=False, methods=['post'])
-    def test_connection(self, request):
-        """测试AI服务连接"""
-        config_id = request.data.get('config_id')
-        if not config_id:
-            return Response({'error': '请提供配置ID'}, status=status.HTTP_400_BAD_REQUEST)
+    def update_config(self, request):
+        """更新单个 Apollo 配置"""
+        from apps.api_testing.apollo_config_manager import ApolloConfigManager, CONFIG_SETTINGS
 
-        try:
-            config = AIServiceConfig.objects.get(id=config_id, created_by=request.user)
-        except AIServiceConfig.DoesNotExist:
-            return Response({'error': '配置不存在'}, status=status.HTTP_404_NOT_FOUND)
+        config_name = request.data.get('config')
+        key = request.data.get('key')
+        value = request.data.get('value')
+        operator = request.data.get('operator', request.user.username)
 
-        try:
-            headers = {
-                'Authorization': f'Bearer {config.api_key}',
-                'Content-Type': 'application/json'
-            }
-
-            test_data = {
-                'model': config.model_name,
-                'messages': [{'role': 'user', 'content': 'Hello'}],
-                'max_tokens': 10
-            }
-
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=test_data,
-                timeout=10
+        # 获取环境配置
+        if config_name not in CONFIG_SETTINGS:
+            return Response(
+                {'error': f'环境配置 {config_name} 不存在'},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-            if response.status_code == 200:
-                return Response({'message': '连接测试成功', 'status': 'success'})
-            else:
-                return Response({
-                    'error': f'连接测试失败: {response.status_code}',
-                    'details': response.text
-                }, status=status.HTTP_400_BAD_REQUEST)
+        config = CONFIG_SETTINGS[config_name]
 
-        except requests.exceptions.Timeout:
-            return Response({'error': '连接超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'连接失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # 从环境变量或请求中获取认证信息
+        username = request.data.get('username')
+        password = request.data.get('password')
+        apollo_username = request.data.get('apollo_username')
+        apollo_password = request.data.get('apollo_password')
+
+        if not all([username, password, apollo_username, apollo_password]):
+            return Response(
+                {'error': '缺少必要的认证信息'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # 创建配置管理器
+            manager = ApolloConfigManager(config['portal_address'])
+
+            # IDS 登录
+            target_url = config['portal_address']
+            appcode = request.data.get('appcode', 'e387d5c4-1a05-4627-9d49-e8034a8f7ba7')
+            ids_cookie = manager.apollo_ids_login(username, password, target_url, appcode)
+
+            # Apollo 登录
+            apollo_host = config['portal_address'].replace('https://', '').replace('http://', '')
+            session_cookie = manager.apollo_login(apollo_username, apollo_password, apollo_host, ids_cookie)
+
+            # 更新配置
+            manager.update_config(
+                config['appId'],
+                config['env'],
+                config['clusterName'],
+                config['namespaceName'],
+                key,
+                value,
+                operator,
+                session_cookie
+            )
+
+            return Response({
+                'message': '配置更新成功',
+                'config': config_name,
+                'key': key,
+                'value': value
+            })
+
         except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {'error': f'配置更新失败: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=False, methods=['post'])
-    def complete_parameter_descriptions(self, request):
-        """使用AI自动补全参数描述"""
-        request_id = request.data.get('request_id')
-        if not request_id:
-            return Response({'error': '请提供请求ID'}, status=status.HTTP_400_BAD_REQUEST)
+    def batch_update(self, request):
+        """批量更新 Apollo 配置"""
+        from apps.api_testing.apollo_config_manager import ApolloConfigManager, CONFIG_SETTINGS
 
-        try:
-            api_request = ApiRequest.objects.get(id=request_id)
-        except ApiRequest.DoesNotExist:
-            return Response({'error': '请求不存在'}, status=status.HTTP_404_NOT_FOUND)
+        config_name = request.data.get('config')
+        operations = request.data.get('operations', [])
+        operator = request.data.get('operator', request.user.username)
 
-        try:
-            config = AIServiceConfig.objects.filter(
-                role='description',
-                is_active=True
-            ).first()
-
-            if not config:
-                return Response({'error': '未找到可用的参数描述补全AI配置'}, status=status.HTTP_400_BAD_REQUEST)
-
-            headers = {
-                'Authorization': f'Bearer {config.api_key}',
-                'Content-Type': 'application/json'
-            }
-
-            request_info = {
-                'name': api_request.name,
-                'description': api_request.description,
-                'method': api_request.method,
-                'url': api_request.url,
-                'headers': api_request.headers,
-                'params': api_request.params,
-                'body': api_request.body
-            }
-
-            prompt = f"""请为以下API请求的参数生成详细的描述说明：
-
-接口名称: {request_info['name']}
-接口描述: {request_info['description']}
-请求方法: {request_info['method']}
-请求URL: {request_info['url']}
-
-请求头参数:
-{json.dumps(request_info['headers'], ensure_ascii=False, indent=2)}
-
-URL参数:
-{json.dumps(request_info['params'], ensure_ascii=False, indent=2)}
-
-请求体参数:
-{json.dumps(request_info['body'], ensure_ascii=False, indent=2)}
-
-请为每个参数生成详细的描述说明，包括：
-1. 参数用途
-2. 数据类型
-3. 是否必填
-4. 取值范围或示例值
-5. 其他注意事项
-
-请返回JSON格式的结果，格式如下：
-{{
-  "headers": {{
-    "参数名": "参数描述"
-  }},
-  "params": {{
-    "参数名": "参数描述"
-  }},
-  "body": {{
-    "参数名": "参数描述"
-  }}
-}}"""
-
-            ai_data = {
-                'model': config.model_name,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': config.max_tokens,
-                'temperature': config.temperature
-            }
-
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
+        # 获取环境配置
+        if config_name not in CONFIG_SETTINGS:
+            return Response(
+                {'error': f'环境配置 {config_name} 不存在'},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                try:
-                    descriptions = json.loads(content)
-                    return Response({'descriptions': descriptions})
-                except json.JSONDecodeError:
-                    return Response({'descriptions': {}, 'raw_content': content})
-            else:
-                return Response({
-                    'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
-                }, status=status.HTTP_400_BAD_REQUEST)
+        config = CONFIG_SETTINGS[config_name]
 
-        except requests.exceptions.Timeout:
-            return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # 获取认证信息
+        username = request.data.get('username')
+        password = request.data.get('password')
+        apollo_username = request.data.get('apollo_username')
+        apollo_password = request.data.get('apollo_password')
 
-    @action(detail=False, methods=['post'])
-    def generate_mock_data(self, request):
-        """使用AI生成模拟数据"""
-        schema = request.data.get('schema', {})
-        count = request.data.get('count', 1)
-        if not schema:
-            return Response({'error': '请提供数据结构定义'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            config = AIServiceConfig.objects.filter(
-                role='mock_data',
-                is_active=True
-            ).first()
-
-            if not config:
-                return Response({'error': '未找到可用的模拟数据生成AI配置'}, status=status.HTTP_400_BAD_REQUEST)
-
-            headers = {
-                'Authorization': f'Bearer {config.api_key}',
-                'Content-Type': 'application/json'
-            }
-
-            prompt = f"""请根据以下数据结构定义，生成{count}条符合该结构的模拟数据：
-
-数据结构定义：
-{json.dumps(schema, ensure_ascii=False, indent=2)}
-
-要求：
-1. 数据必须符合给定的结构定义
-2. 字符串字段生成有意义的中文内容
-3. 数值字段生成合理的数值
-4. 日期字段生成有效的日期时间
-5. 布尔字段随机生成true/false
-6. 数组字段生成适当数量的元素
-
-请返回JSON数组格式的结果。"""
-
-            ai_data = {
-                'model': config.model_name,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': config.max_tokens,
-                'temperature': config.temperature
-            }
-
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
+        if not all([username, password, apollo_username, apollo_password]):
+            return Response(
+                {'error': '缺少必要的认证信息'},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                try:
-                    mock_data = json.loads(content)
-                    return Response({'data': mock_data})
-                except json.JSONDecodeError:
-                    return Response({'data': [], 'raw_content': content})
-            else:
-                return Response({
-                    'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-        except requests.exceptions.Timeout:
-            return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['post'])
-    def normalize_parameter_names(self, request):
-        """使用AI规范化参数名称"""
-        parameters = request.data.get('parameters', [])
-        if not parameters:
-            return Response({'error': '请提供参数列表'}, status=status.HTTP_400_BAD_REQUEST)
-
         try:
-            config = AIServiceConfig.objects.filter(
-                role='naming',
-                is_active=True
-            ).first()
+            # 创建配置管理器
+            manager = ApolloConfigManager(config['portal_address'])
 
-            if not config:
-                return Response({'error': '未找到可用的参数命名规范化AI配置'}, status=status.HTTP_400_BAD_REQUEST)
+            # IDS 登录
+            target_url = config['portal_address']
+            appcode = request.data.get('appcode', 'e387d5c4-1a05-4627-9d49-e8034a8f7ba7')
+            ids_cookie = manager.apollo_ids_login(username, password, target_url, appcode)
 
-            headers = {
-                'Authorization': f'Bearer {config.api_key}',
-                'Content-Type': 'application/json'
-            }
+            # Apollo 登录
+            apollo_host = config['portal_address'].replace('https://', '').replace('http://', '')
+            session_cookie = manager.apollo_login(apollo_username, apollo_password, apollo_host, ids_cookie)
 
-            params_info = '\n'.join([f"- {param.get('key', '')}: {param.get('value', '')}" for param in parameters])
+            # 构建操作列表
+            formatted_operations = []
+            for op in operations:
+                formatted_operations.append({
+                    'app_id': config['appId'],
+                    'env': config['env'],
+                    'cluster_name': config['clusterName'],
+                    'namespace_name': config['namespaceName'],
+                    'key': op['key'],
+                    'value': op['value'],
+                    'operator': operator
+                })
 
-            prompt = f"""请对以下API参数名称进行规范化处理，使其符合RESTful API命名规范：
+            # 批量更新
+            manager.batch_update_configs(formatted_operations, session_cookie)
 
-{params_info}
+            return Response({
+                'message': '批量配置更新成功',
+                'count': len(operations)
+            })
 
-请返回JSON格式的结果，包含：
-1. 原始参数名
-2. 建议的规范化参数名（使用小写字母、下划线分隔、语义清晰）
-3. 修改原因
-
-返回格式示例：
-[
-  {{
-    "original": "userName",
-    "suggested": "user_name",
-    "reason": "使用下划线分隔单词，符合Python命名规范"
-  }}
-]"""
-
-            ai_data = {
-                'model': config.model_name,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': config.max_tokens,
-                'temperature': config.temperature
-            }
-
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
+        except Exception as e:
+            return Response(
+                {'error': f'批量配置更新失败: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                try:
-                    suggestions = json.loads(content)
-                    return Response({'suggestions': suggestions})
-                except json.JSONDecodeError:
-                    return Response({'suggestions': [], 'raw_content': content})
-            else:
-                return Response({
-                    'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-        except requests.exceptions.Timeout:
-            return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['post'])
-    def extract_documentation(self, request):
-        """使用AI提取API文档"""
-        request_id = request.data.get('request_id')
-        if not request_id:
-            return Response({'error': '请提供请求ID'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            api_request = ApiRequest.objects.get(id=request_id)
-        except ApiRequest.DoesNotExist:
-            return Response({'error': '请求不存在'}, status=status.HTTP_404_NOT_FOUND)
-
-        try:
-            config = AIServiceConfig.objects.filter(
-                role='doc_extractor',
-                is_active=True
-            ).first()
-
-            if not config:
-                return Response({'error': '未找到可用的API文档提取AI配置'}, status=status.HTTP_400_BAD_REQUEST)
-
-            request_data = {
-                'method': api_request.method,
-                'url': api_request.url,
-                'headers': api_request.headers,
-                'params': api_request.params,
-                'body': api_request.body,
-                'description': api_request.description
-            }
-
-            headers = {
-                'Authorization': f'Bearer {config.api_key}',
-                'Content-Type': 'application/json'
-            }
-
-            prompt = f"""请根据以下API请求信息，生成详细的API文档：
-
-请求方法: {request_data['method']}
-请求URL: {request_data['url']}
-请求头: {json.dumps(request_data['headers'], ensure_ascii=False)}
-URL参数: {json.dumps(request_data['params'], ensure_ascii=False)}
-请求体: {json.dumps(request_data['body'], ensure_ascii=False)}
-描述: {request_data['description']}
-
-请生成包含以下内容的API文档：
-1. 接口概述
-2. 请求参数说明（包括路径参数、查询参数、请求头、请求体）
-3. 响应示例
-4. 错误码说明
-
-请以Markdown格式返回文档内容。"""
-
-            ai_data = {
-                'model': config.model_name,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': config.max_tokens,
-                'temperature': config.temperature
-            }
-
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                documentation = result['choices'][0]['message']['content']
-                return Response({'documentation': documentation})
-            else:
-                return Response({
-                    'error': f'AI服务调用失败: {response.status_code}',
-                    'details': response.text
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-        except requests.exceptions.Timeout:
-            return Response({'error': 'AI服务调用超时'}, status=status.HTTP_408_REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            return Response({'error': f'AI服务调用失败: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            return Response({'error': f'未知错误: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
