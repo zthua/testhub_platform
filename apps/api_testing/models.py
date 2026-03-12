@@ -79,8 +79,8 @@ class ApiRequest(models.Model):
         ('OPTIONS', 'OPTIONS'),
     ]
 
-    collection = models.ForeignKey(ApiCollection, on_delete=models.CASCADE, null=True, blank=True,
-                                   related_name='requests', verbose_name='所属集合')
+    collection = models.ForeignKey(ApiCollection, on_delete=models.CASCADE, related_name='requests',
+                                   verbose_name='所属集合')
     name = models.CharField(max_length=200, verbose_name='请求名称')
     description = models.TextField(blank=True, verbose_name='请求描述')
     request_type = models.CharField(max_length=20, choices=REQUEST_TYPE_CHOICES, default='HTTP',
@@ -95,6 +95,30 @@ class ApiRequest(models.Model):
     post_request_script = models.TextField(blank=True, verbose_name='请求后脚本')
     assertions = models.JSONField(default=list, verbose_name='断言规则')
     order = models.IntegerField(default=0, verbose_name='排序')
+    
+    # 签名配置
+    signature_config = models.ForeignKey(
+        'SignatureConfig',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='requests',
+        verbose_name='签名配置'
+    )
+    enable_signature = models.BooleanField(default=False, verbose_name='启用签名')
+
+    # 脚本管理相关字段
+    pre_request_script_ref = models.ForeignKey(
+        'Script', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='pre_request_requests', verbose_name='前置脚本'
+    )
+    post_request_script_ref = models.ForeignKey(
+        'Script', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='post_request_requests', verbose_name='后置脚本'
+    )
+    enable_pre_request_script = models.BooleanField(default=False, verbose_name='启用前置脚本')
+    enable_post_request_script = models.BooleanField(default=False, verbose_name='启用后置脚本')
+
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='创建者')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
@@ -190,6 +214,10 @@ class TestSuiteRequest(models.Model):
     order = models.IntegerField(default=0, verbose_name='执行顺序')
     assertions = models.JSONField(default=list, verbose_name='断言规则')
     enabled = models.BooleanField(default=True, verbose_name='是否启用')
+    wait_time = models.IntegerField(default=0, verbose_name='等待时间（秒）', help_text='执行前等待时间')
+    user_inputs = models.JSONField(default=dict, verbose_name='用户输入参数', help_text='运行时需要用户输入的参数')
+    require_runtime_input = models.BooleanField(default=False, verbose_name='需要运行时输入', help_text='执行时是否需要用户输入参数')
+    runtime_input_config = models.JSONField(default=dict, verbose_name='运行时输入配置', help_text='运行时输入参数的配置信息')
 
     class Meta:
         db_table = 'api_test_suite_requests'
@@ -234,6 +262,22 @@ class TestExecution(models.Model):
     def __str__(self):
         return f"{self.test_suite.name} - {self.created_at}"
 
+class Script(models.Model):
+    """脚本模型 - 用于管理前置和后置脚本"""
+    SCRIPT_TYPE_CHOICES = [
+        ('python', 'Python'),
+        ('javascript', 'JavaScript'),
+    ]
+    
+    name = models.CharField(max_length=200, verbose_name='脚本名称')
+    description = models.TextField(blank=True, verbose_name='脚本描述')
+    script_type = models.CharField(max_length=20, choices=SCRIPT_TYPE_CHOICES, default='python')
+    content = models.TextField(verbose_name='脚本内容')
+    is_active = models.BooleanField(default=True, verbose_name='是否激活')
+    project = models.ForeignKey(ApiProject, on_delete=models.CASCADE, related_name='scripts')
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='scripts')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 # 定时任务相关模型
 class ScheduledTask(models.Model):
@@ -592,47 +636,122 @@ class OperationLog(models.Model):
         return f"{self.get_operation_type_display()} - {self.resource_name}"
 
 
-class AIServiceConfig(models.Model):
-    """AI服务配置模型"""
-    SERVICE_TYPE_CHOICES = [
-        ('openai', 'OpenAI'),
-        ('azure', 'Azure OpenAI'),
-        ('anthropic', 'Anthropic'),
-        ('deepseek', 'DeepSeek'),
-        ('qwen', '通义千问'),
-        ('siliconflow', '硅基流动'),
-        ('other', '其他'),
+class SignatureConfig(models.Model):
+    """签名配置模型"""
+    ALGORITHM_CHOICES = [
+        ('MD5', 'MD5'),
+        ('SHA1', 'SHA1'),
+        ('SHA256', 'SHA256'),
+        ('HMAC-SHA1', 'HMAC-SHA1'),
+        ('HMAC-SHA256', 'HMAC-SHA256'),
+        ('RSA-SHA256', 'RSA-SHA256'),
+        ('RSA-SHA512', 'RSA-SHA512'),
+        ('RSA-MD5', 'RSA-MD5'),
+        ('SM2', 'SM2'),
     ]
+    
+    project = models.ForeignKey(
+        ApiProject, 
+        on_delete=models.CASCADE, 
+        related_name='signature_configs',
+        verbose_name='关联项目'
+    )
+    name = models.CharField(max_length=100, verbose_name='配置名称')
+    description = models.TextField(blank=True, verbose_name='配置描述')
+    
+    # 签名算法
+    algorithm = models.CharField(
+        max_length=20, 
+        choices=ALGORITHM_CHOICES,
+        default='MD5',
+        verbose_name='签名算法'
+    )
+    
+    # 签名密钥（用于HMAC算法）
+    secret_key = models.CharField(max_length=500, blank=True, verbose_name='签名密钥')
 
-    ROLE_CHOICES = [
-        ('doc_extractor', 'API文档提取'),
-        ('naming', '参数命名规范化'),
-        ('mock_data', '模拟数据生成'),
-        ('description', '参数描述补全'),
-    ]
+    # RSA 私钥（用于 RSA 签名）
+    rsa_private_key = models.TextField(blank=True, verbose_name='RSA私钥')
 
-    name = models.CharField(max_length=200, verbose_name='配置名称')
-    service_type = models.CharField(max_length=20, choices=SERVICE_TYPE_CHOICES, verbose_name='服务类型')
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, verbose_name='角色类型')
-    api_key = models.CharField(max_length=500, verbose_name='API Key')
-    base_url = models.CharField(max_length=500, verbose_name='API Base URL')
-    model_name = models.CharField(max_length=200, verbose_name='模型名称')
-    max_tokens = models.IntegerField(default=4096, verbose_name='最大Token数')
-    temperature = models.FloatField(default=0.7, verbose_name='温度参数')
-    is_active = models.BooleanField(default=True, verbose_name='是否启用')
-    created_by = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name='创建者')
+    # RSA 公钥（用于 RSA 验签，可选）
+    rsa_public_key = models.TextField(blank=True, verbose_name='RSA公钥')
+
+    # RSA 加密公钥（用于 RSA 加密请求参数）
+    rsa_encrypt_public_key = models.TextField(blank=True, verbose_name='RSA加密公钥')
+
+    # SM2 私钥（用于 SM2 签名）
+    sm2_private_key = models.CharField(max_length=200, blank=True, verbose_name='SM2私钥')
+
+    # SM2 公钥（用于 SM2 验签，可选）
+    sm2_public_key = models.CharField(max_length=200, blank=True, verbose_name='SM2公钥')
+
+    # SM2 模式（C1C3C2 或 C1C2C3）
+    sm2_mode = models.CharField(
+        max_length=10,
+        choices=[('C1C3C2', 'C1C3C2 (旧标准)'), ('C1C2C3', 'C1C2C3 (新标准)')],
+        default='C1C2C3',
+        blank=True,
+        verbose_name='SM2模式'
+    )
+    
+    # 签名参数（额外参与签名的参数，JSON格式）
+    # 例如: {"timestamp": "{{timestamp}}", "nonce": "{{nonce}}"}
+    extra_params = models.JSONField(default=dict, blank=True, verbose_name='额外签名参数')
+    
+    # 额外参数是否参与签名（默认为False，只对body进行签名）
+    extra_params_in_sign = models.BooleanField(
+        default=False,
+        verbose_name='额外参数参与签名',
+        help_text='如果勾选，额外参数将参与签名计算；否则只对请求体进行签名'
+    )
+    
+    # 签名放置位置
+    signature_location = models.CharField(
+        max_length=20,
+        choices=[('header', 'Header'), ('body', 'Body'), ('query', 'Query参数')],
+        default='header',
+        verbose_name='签名位置'
+    )
+    
+    # 签名字段名称
+    signature_field = models.CharField(
+        max_length=100,
+        default='Signature-Data',
+        verbose_name='签名字段名'
+    )
+    
+    # 是否启用
+    is_enabled = models.BooleanField(default=True, verbose_name='是否启用')
+    
+    # 是否为项目默认配置
+    is_default = models.BooleanField(default=False, verbose_name='是否为默认配置')
+    
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_signature_configs',
+        verbose_name='创建人'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
-
+    
     class Meta:
-        db_table = 'api_ai_service_configs'
-        verbose_name = 'AI服务配置'
-        verbose_name_plural = 'AI服务配置'
+        db_table = 'api_signature_configs'
+        verbose_name = '签名配置'
+        verbose_name_plural = '签名配置'
         ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['service_type', 'role']),
-            models.Index(fields=['is_active']),
-        ]
-
+        unique_together = [['project', 'name']]
+    
     def __str__(self):
-        return self.name
+        return f"{self.project.name} - {self.name}"
+    
+    def save(self, *args, **kwargs):
+        # 如果设置为默认配置，取消同项目下其他配置的默认状态
+        if self.is_default:
+            SignatureConfig.objects.filter(
+                project=self.project,
+                is_default=True
+            ).exclude(id=self.id).update(is_default=False)
+        super().save(*args, **kwargs)
+
